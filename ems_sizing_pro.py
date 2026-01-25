@@ -3,24 +3,30 @@ import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
 import io, os, json
-from pathlib import Path
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 
-# --- PATH & BRANDING ---
-SCRIPT_DIR = Path(__file__).parent if "__file__" in locals() else Path.cwd()
-LOGO_PATH = SCRIPT_DIR / "kempowerlogo.png"
+# --- ASSET & BRANDING ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(SCRIPT_DIR, "kempower_logo.png") 
 KEMPOWER_ORANGE = "#FF6400"
 
+# Removed version from page title
 st.set_page_config(page_title="Kempower | BESS Sizing", layout="wide")
 
+# --- CSS INJECTION (Hides Menu/Footer) ---
 st.markdown(f"""
     <style>
+    #MainMenu {{visibility: hidden;}}
+    footer {{visibility: hidden;}}
+    header {{visibility: hidden;}}
+
     .reportview-container .main .block-container {{ padding-top: 1rem; }}
     .stMetric {{ background-color: #ffffff; padding: 10px; border-radius: 8px; border-left: 5px solid {KEMPOWER_ORANGE}; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
     .kpi-header {{ font-size: 1.1rem; font-weight: bold; margin-bottom: 10px; color: #333; }}
+    .qos-text {{ font-size: 0.85rem; color: #444; margin-bottom: 8px; line-height: 1.3; border-bottom: 1px solid #eee; padding-bottom: 4px; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -42,11 +48,11 @@ BESS_POWER_MAP = {
 
 # --- SIDEBAR ---
 with st.sidebar:
-    if os.path.exists(LOGO_PATH): st.image(str(LOGO_PATH), width=180)
+    if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=180)
     st.markdown("### 🏢 Site Parameters")
     grid_limit = st.number_input("Grid Limit (kW)", value=150)
-    num_plugs = st.number_input("Plugs", value=10)
-    charger_cap = st.number_input("Site Charger Capacity (kW)", value=600, help="Physical limit of charging hardware")
+    num_plugs = st.number_input("Satellites", value=10)
+    charger_cap = st.number_input("Site Charger Capacity (kW)", value=600)
     
     cap_options = sorted(list(BESS_POWER_MAP.keys()))
     nominal_cap = st.selectbox("BESS Capacity (kWh)", cap_options, index=cap_options.index(560))
@@ -61,7 +67,7 @@ with st.sidebar:
     growth_rate = st.slider("Annual Growth (%)", 0, 20, 5) / 100
 
 if uploaded_file:
-    # --- DATA LOADING ---
+    # --- SIMULATION ENGINE ---
     try:
         df_base = pd.read_csv(uploaded_file, sep=None, engine='python')
     except:
@@ -71,24 +77,17 @@ if uploaded_file:
     if df_base.shape[1] < 2: 
         uploaded_file.seek(0)
         df_base = pd.read_csv(uploaded_file, sep=';')
-
+    
+    # Robust Column Renaming
     df_base.columns = df_base.columns.str.strip()
-    
-    if 'Timestamp' in df_base.columns: df_base.rename(columns={'Timestamp': 'timestamp'}, inplace=True)
-    if 'timestamp' not in df_base.columns: df_base.rename(columns={df_base.columns[0]: 'timestamp'}, inplace=True)
-    
-    if 'load_kw' not in df_base.columns:
-         if 'Power [kW]' in df_base.columns:
-             df_base.rename(columns={'Power [kW]': 'raw_load'}, inplace=True)
-         else:
-             df_base.rename(columns={df_base.columns[1]: 'raw_load'}, inplace=True)
-    else:
-        df_base.rename(columns={'load_kw': 'raw_load'}, inplace=True)
+    col_map = {df_base.columns[0]: 'timestamp', df_base.columns[1]: 'raw_load'}
+    if 'Timestamp' in df_base.columns: col_map['Timestamp'] = 'timestamp'
+    if 'Power [kW]' in df_base.columns: col_map['Power [kW]'] = 'raw_load'
+    df_base.rename(columns=col_map, inplace=True)
 
     df_base['timestamp'] = pd.to_datetime(df_base['timestamp'], dayfirst=True)
     df_base['day_name'] = df_base['timestamp'].dt.day_name()
     
-    # --- SIMULATION PARAMETERS ---
     step_hrs, year_mult = 5/60, 365/7
     current_usable_kwh = nominal_cap * usable_factor
     initial_kwh = current_usable_kwh
@@ -104,7 +103,6 @@ if uploaded_file:
         df['load_theoretical'] = df['raw_load'] * load_multiplier * ((1 + growth_rate) ** (year - 1))
         
         # 2. Physical Load to Serve (Capped by Charger Capacity)
-        # The Grid+BESS system can only attempt to serve what the chargers can output.
         df['load_to_serve'] = np.minimum(df['load_theoretical'], charger_cap)
         
         n = len(df)
@@ -112,7 +110,6 @@ if uploaded_file:
         missed_energy_yr, current_soc = 0, current_usable_kwh * 0.5
 
         for i in range(n):
-            # We try to meet the 'load_to_serve'
             demand = df['load_to_serve'].iloc[i]
             max_p = bess_max_power 
             
@@ -128,7 +125,6 @@ if uploaded_file:
             current_soc += (bess_char[i] * 0.85 - bess_disc[i] / 0.85) * step_hrs
             
             # Missed Energy Logic
-            # Missed = What the EVs wanted (Theoretical) - What we delivered (Grid + BESS)
             delivered = grid_used[i] + bess_disc[i]
             unmet = df['load_theoretical'].iloc[i] - delivered
             if unmet > 0.001:
@@ -162,7 +158,11 @@ if uploaded_file:
         df['grid_used'], df['bess_disc'] = grid_used, bess_disc
         plot_data[year] = df.copy()
         current_usable_kwh *= 0.985
+        
+        # --- SOPHISTICATED DEGRADATION LOGIC ---
+        # Simulates non-linear degradation based on cycle count stages
         for _ in range(int(yearly_cycles)): 
+            # 0-800: Break-in; 800-2500: Stable; >2500: Accelerated
             rate = 0.0045 if total_lifetime_cycles <= 800 else (0.0018 if total_lifetime_cycles <= 2500 else 0.0055)
             current_usable_kwh *= (1 - (rate / 100))
 
@@ -177,7 +177,7 @@ if uploaded_file:
     c3.metric("Unmet Demand Ratio", f"{(total_missed_mwh/total_ev_mwh)*100:.2f}%")
     c4.metric("Avg Plug Throughput", f"{np.mean([x['Plug Thr'] for x in yearly_results]):.1f} kWh/d")
 
-    # --- CHART ---
+    # --- FULL-WIDTH CHART ---
     st.write("---")
     view_yr = st.selectbox("Year Profile:", list(range(1, 11)), label_visibility="collapsed")
     p_df = plot_data[view_yr]
@@ -188,16 +188,10 @@ if uploaded_file:
         if indices: day_indices.append(indices[len(indices)//2]); unique_days.append(day)
 
     fig = go.Figure()
-    # Grid Power
     fig.add_trace(go.Bar(name='Grid', x=p_df.index, y=p_df['grid_used'], marker_color='#2b579a', opacity=0.8, hovertemplate='%{y} kW<extra></extra>'))
-    # BESS Power
     fig.add_trace(go.Bar(name='BESS Supplement', x=p_df.index, y=p_df['bess_disc'], marker_color='#7eb26d', hovertemplate='%{y} kW<extra></extra>'))
-    
-    # EV Demand Line (Using Theoretical Load to show potential undersizing)
     fig.add_trace(go.Scatter(name='EV Demand (Theoretical)', x=p_df.index, y=p_df['load_theoretical'], 
                              line=dict(color=KEMPOWER_ORANGE, width=2, dash='dot'), hovertemplate='%{y} kW<extra></extra>'))
-    
-    # Charger Capacity Limit Line
     fig.add_shape(type="line", x0=p_df.index[0], x1=p_df.index[-1], y0=charger_cap, y1=charger_cap,
                   line=dict(color="Red", width=1, dash="dashdot"))
     
@@ -211,7 +205,7 @@ if uploaded_file:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- EXPORTS ---
+    # --- BOTTOM SECTION ---
     st.write("---")
     res_col, qos_col = st.columns([2.2, 1])
     with res_col:
@@ -225,37 +219,71 @@ if uploaded_file:
         st.markdown('<div class="qos-text"><b>2% - 5% Warning:</b> Risk of throttled user sessions.</div>', unsafe_allow_html=True)
         st.markdown('<div class="qos-text"><b>> 5% Critical:</b> Unmet demand exceeds acceptable thresholds.</div>', unsafe_allow_html=True)
         
+        # --- PDF GENERATOR ---
         def generate_pdf(res_df):
             buf = io.BytesIO()
             doc = SimpleDocTemplate(buf, pagesize=A4)
             els = []
             styles = getSampleStyleSheet()
-            if os.path.exists(LOGO_PATH): els.append(RLImage(str(LOGO_PATH), width=120, height=40)); els.append(Spacer(1, 10))
+
+            if os.path.exists(LOGO_PATH): 
+                els.append(RLImage(LOGO_PATH, width=120, height=40))
+                els.append(Spacer(1, 10))
+            
             els.append(Paragraph("Kempower | BESS Sizing Report", styles['Title']))
-            els.append(Spacer(1, 15))
+            els.append(Spacer(1, 20))
+
+            # Params Table
+            param_data = [
+                ["Parameter", "Value", "Parameter", "Value"], 
+                ["Grid Limit", f"{grid_limit} kW", "BESS Capacity", f"{nominal_cap} kWh"],
+                ["Charger Capacity", f"{charger_cap} kW", "Usable Factor", f"{usable_factor}"],
+                ["Satellites", f"{num_plugs}", "Load Scaling", f"{load_multiplier}x"],
+                ["Growth Rate", f"{growth_rate*100:.1f}%", "Source File", f"{uploaded_file.name}"]
+            ]
+            t_params = Table(param_data, colWidths=[110, 80, 110, 180])
+            t_params.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#444444")),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+            ]))
+            els.append(t_params)
+            els.append(Spacer(1, 20))
+
+            # Results Table
             data = [["Year"] + res_df.columns.tolist()] + [[i] + row for i, row in zip(res_df.index, res_df.values.tolist())]
-            t = Table(data)
-            t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor(KEMPOWER_ORANGE)), ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('GRID', (0,0), (-1,-1), 0.5, colors.grey), ('FONTSIZE', (0,0), (-1,-1), 8)]))
-            els.append(t)
+            t_res = Table(data)
+            t_res.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor(KEMPOWER_ORANGE)),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                ('FONTSIZE', (0,0), (-1,-1), 8),
+            ]))
+            els.append(t_res)
+            
             doc.build(els)
             return buf.getvalue()
-            
+        
+        # --- SMART EXPORT GENERATOR ---
         def generate_smart_export(base_df, metadata):
             buffer = io.StringIO()
             json_meta = json.dumps(metadata)
             buffer.write(f"# METADATA_JSON:{json_meta}\n")
             
-            # Export the RAW load so the Business App can re-apply its own scaling/capping logic
+            # Export raw_load and re-process in app
             export_df = base_df[['timestamp', 'raw_load']].copy()
-            export_df.columns = ['timestamp', 'load_kw'] 
+            export_df.columns = ['timestamp', 'load_kw']
             export_df['timestamp'] = export_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-            
             export_df.to_csv(buffer, index=False)
             return buffer.getvalue().encode('utf-8')
 
         st.divider()
-        st.download_button("📥 Results PDF Report", generate_pdf(final_df), "Kempower_BESS_Report.pdf", "application/pdf", use_container_width=True)
+        st.download_button("📥 Results PDF Report", generate_pdf(final_df), "Kempower_BESS_Sizing_Report.pdf", "application/pdf", use_container_width=True)
         
+        # --- EXPORT BUTTON LOGIC ---
+        # Calculate derived average annual degradation rate from your sophisticated logic
         final_soh_val = (current_usable_kwh/initial_kwh)*100
         approx_deg_rate = (100 - final_soh_val) / 10
         avg_plug_val = np.mean([x['Plug Thr'] for x in yearly_results])
@@ -265,7 +293,7 @@ if uploaded_file:
             'bess_capacity': nominal_cap,
             'charger_cap': charger_cap,
             'growth_rate': growth_rate * 100,
-            'degradation_rate': approx_deg_rate,
+            'degradation_rate': approx_deg_rate, # Passes the result of sophisticated logic
             'load_multiplier': load_multiplier,
             'total_cycles': int(total_lifetime_cycles),
             'final_soh': round(final_soh_val, 1),
@@ -273,8 +301,9 @@ if uploaded_file:
         }
         
         csv_data = generate_smart_export(df_base, meta)
+        # Removed version from filename
         st.download_button("📊 Export Data for Trade-Off", csv_data, "kempower_smart_export.csv", "text/csv", use_container_width=True)
-        
 else:
-    st.title("⚡ Kempower | BESS Sizing Tool v5.6")
-    st.info("Please upload a 7-day ChargEye load profile to begin the simulation.")
+    # Removed version from Title
+    st.title("⚡ Kempower | BESS Sizing Tool")
+    st.info("Please upload a 7-day CSV load profile to begin the simulation.")
